@@ -1,23 +1,23 @@
 //! Initialization logic for a generic instance of the `Allocate` channel allocation trait.
 
-use std::thread;
-#[cfg(feature = "getopts")]
-use std::io::BufRead;
 #[cfg(feature = "getopts")]
 use getopts;
+#[cfg(feature = "getopts")]
+use std::io::BufRead;
 use std::sync::Arc;
+use std::thread;
 
 use std::any::Any;
 
+use crate::allocator::io_uring::initialize::initialize_networking as uring_initialize_networking;
 use crate::allocator::thread::ThreadBuilder;
-use crate::allocator::{AllocateBuilder, Process, Generic, GenericBuilder};
 use crate::allocator::zero_copy::allocator_process::ProcessBuilder;
-use crate::allocator::zero_copy::initialize::initialize_networking;
+use crate::allocator::zero_copy::initialize::initialize_networking as zc_initialize_networking;
+use crate::allocator::{AllocateBuilder, Generic, GenericBuilder, Process};
 
-use crate::logging::{CommunicationSetup, CommunicationEvent};
+use crate::logging::{CommunicationEvent, CommunicationSetup};
 use logging_core::Logger;
 use std::fmt::{Debug, Formatter};
-
 
 /// Possible configurations for the communication infrastructure.
 pub enum Config {
@@ -38,8 +38,29 @@ pub enum Config {
         /// Verbosely report connection process
         report: bool,
         /// Closure to create a new logger for a communication thread
-        log_fn: Box<dyn Fn(CommunicationSetup) -> Option<Logger<CommunicationEvent, CommunicationSetup>> + Send + Sync>,
-    }
+        log_fn: Box<
+            dyn Fn(CommunicationSetup) -> Option<Logger<CommunicationEvent, CommunicationSetup>>
+                + Send
+                + Sync,
+        >,
+    },
+    /// Expect multiple processes.
+    IoUring {
+        /// Number of per-process worker threads
+        threads: usize,
+        /// Identity of this process
+        process: usize,
+        /// Addresses of all processes
+        addresses: Vec<String>,
+        /// Verbosely report connection process
+        report: bool,
+        /// Closure to create a new logger for a communication thread
+        log_fn: Box<
+            dyn Fn(CommunicationSetup) -> Option<Logger<CommunicationEvent, CommunicationSetup>>
+                + Send
+                + Sync,
+        >,
+    },
 }
 
 impl Debug for Config {
@@ -48,14 +69,34 @@ impl Debug for Config {
             Config::Thread => write!(f, "Config::Thread()"),
             Config::Process(n) => write!(f, "Config::Process({})", n),
             Config::ProcessBinary(n) => write!(f, "Config::ProcessBinary({})", n),
-            Config::Cluster { threads, process, addresses, report, .. } => f
+            Config::Cluster {
+                threads,
+                process,
+                addresses,
+                report,
+                ..
+            } => f
                 .debug_struct("Config::Cluster")
                 .field("threads", threads)
                 .field("process", process)
                 .field("addresses", addresses)
                 .field("report", report)
                 // TODO: Use `.finish_non_exhaustive()` after rust/#67364 lands
-                .finish()
+                .finish(),
+            Config::IoUring {
+                threads,
+                process,
+                addresses,
+                report,
+                ..
+            } => f
+                .debug_struct("Config::IoUring")
+                .field("threads", threads)
+                .field("process", process)
+                .field("addresses", addresses)
+                .field("report", report)
+                // TODO: Use `.finish_non_exhaustive()` after rust/#67364 lands
+                .finish(),
         }
     }
 }
@@ -72,12 +113,31 @@ impl Config {
     /// it is by default.
     #[cfg(feature = "getopts")]
     pub fn install_options(opts: &mut getopts::Options) {
-        opts.optopt("w", "threads", "number of per-process worker threads", "NUM");
+        opts.optopt(
+            "w",
+            "threads",
+            "number of per-process worker threads",
+            "NUM",
+        );
         opts.optopt("p", "process", "identity of this process", "IDX");
         opts.optopt("n", "processes", "number of processes", "NUM");
-        opts.optopt("h", "hostfile", "text file whose lines are process addresses", "FILE");
+        opts.optopt(
+            "h",
+            "hostfile",
+            "text file whose lines are process addresses",
+            "FILE",
+        );
         opts.optflag("r", "report", "reports connection progress");
-        opts.optflag("z", "zerocopy", "enable zero-copy for intra-process communication");
+        opts.optflag(
+            "z",
+            "zerocopy",
+            "enable zero-copy for intra-process communication",
+        );
+        opts.optflag(
+            "u",
+            "io-uring",
+            "enable io-uring for intra-process communication",
+        );
     }
 
     /// Instantiates a configuration based upon the parsed options in `matches`.
@@ -90,13 +150,20 @@ impl Config {
     /// it is by default.
     #[cfg(feature = "getopts")]
     pub fn from_matches(matches: &getopts::Matches) -> Result<Config, String> {
-        let threads = matches.opt_get_default("w", 1_usize).map_err(|e| e.to_string())?;
-        let process = matches.opt_get_default("p", 0_usize).map_err(|e| e.to_string())?;
-        let processes = matches.opt_get_default("n", 1_usize).map_err(|e| e.to_string())?;
+        let threads = matches
+            .opt_get_default("w", 1_usize)
+            .map_err(|e| e.to_string())?;
+        let process = matches
+            .opt_get_default("p", 0_usize)
+            .map_err(|e| e.to_string())?;
+        let processes = matches
+            .opt_get_default("n", 1_usize)
+            .map_err(|e| e.to_string())?;
         let report = matches.opt_present("report");
         let zerocopy = matches.opt_present("zerocopy");
+        let io_uring = matches.opt_present("io-uring");
 
-        if processes > 1 {
+        if processes > 1 && !io_uring {
             let mut addresses = Vec::new();
             if let Some(hosts) = matches.opt_str("h") {
                 let file = ::std::fs::File::open(hosts.clone()).map_err(|e| e.to_string())?;
@@ -105,10 +172,14 @@ impl Config {
                     addresses.push(line.map_err(|e| e.to_string())?);
                 }
                 if addresses.len() < processes {
-                    return Err(format!("could only read {} addresses from {}, but -n: {}", addresses.len(), hosts, processes));
+                    return Err(format!(
+                        "could only read {} addresses from {}, but -n: {}",
+                        addresses.len(),
+                        hosts,
+                        processes
+                    ));
                 }
-            }
-            else {
+            } else {
                 for index in 0..processes {
                     addresses.push(format!("localhost:{}", 2101 + index));
                 }
@@ -120,7 +191,37 @@ impl Config {
                 process,
                 addresses,
                 report,
-                log_fn: Box::new( | _ | None),
+                log_fn: Box::new(|_| None),
+            })
+        } else if processes > 1 && io_uring {
+            let mut addresses = Vec::new();
+            if let Some(hosts) = matches.opt_str("h") {
+                let file = ::std::fs::File::open(hosts.clone()).map_err(|e| e.to_string())?;
+                let reader = ::std::io::BufReader::new(file);
+                for line in reader.lines().take(processes) {
+                    addresses.push(line.map_err(|e| e.to_string())?);
+                }
+                if addresses.len() < processes {
+                    return Err(format!(
+                        "could only read {} addresses from {}, but -n: {}",
+                        addresses.len(),
+                        hosts,
+                        processes
+                    ));
+                }
+            } else {
+                for index in 0..(threads * processes) {
+                    addresses.push(format!("localhost:{}", 2101 + index));
+                }
+            }
+
+            assert!((threads * processes) == addresses.len());
+            Ok(Config::IoUring {
+                threads,
+                process,
+                addresses,
+                report,
+                log_fn: Box::new(|_| None),
             })
         } else if threads > 1 {
             if zerocopy {
@@ -140,7 +241,7 @@ impl Config {
     /// This method is only available if the `getopts` feature is enabled, which
     /// it is by default.
     #[cfg(feature = "getopts")]
-    pub fn from_args<I: Iterator<Item=String>>(args: I) -> Result<Config, String> {
+    pub fn from_args<I: Iterator<Item = String>>(args: I) -> Result<Config, String> {
         let mut opts = getopts::Options::new();
         Config::install_options(&mut opts);
         let matches = opts.parse(args).map_err(|e| e.to_string())?;
@@ -148,24 +249,54 @@ impl Config {
     }
 
     /// Attempts to assemble the described communication infrastructure.
-    pub fn try_build(self) -> Result<(Vec<GenericBuilder>, Box<dyn Any+Send>), String> {
+    pub fn try_build(self) -> Result<(Vec<GenericBuilder>, Box<dyn Any + Send>), String> {
         match self {
-            Config::Thread => {
-                Ok((vec![GenericBuilder::Thread(ThreadBuilder)], Box::new(())))
+            Config::Thread => Ok((vec![GenericBuilder::Thread(ThreadBuilder)], Box::new(()))),
+            Config::Process(threads) => Ok((
+                Process::new_vector(threads)
+                    .into_iter()
+                    .map(|x| GenericBuilder::Process(x))
+                    .collect(),
+                Box::new(()),
+            )),
+            Config::ProcessBinary(threads) => Ok((
+                ProcessBuilder::new_vector(threads)
+                    .into_iter()
+                    .map(|x| GenericBuilder::ProcessBinary(x))
+                    .collect(),
+                Box::new(()),
+            )),
+            Config::Cluster {
+                threads,
+                process,
+                addresses,
+                report,
+                log_fn,
+            } => match zc_initialize_networking(addresses, process, threads, report, log_fn) {
+                Ok((stuff, guard)) => Ok((
+                    stuff
+                        .into_iter()
+                        .map(|x| GenericBuilder::ZeroCopy(x))
+                        .collect(),
+                    Box::new(guard),
+                )),
+                Err(err) => Err(format!("failed to initialize networking: {}", err)),
             },
-            Config::Process(threads) => {
-                Ok((Process::new_vector(threads).into_iter().map(|x| GenericBuilder::Process(x)).collect(), Box::new(())))
-            },
-            Config::ProcessBinary(threads) => {
-                Ok((ProcessBuilder::new_vector(threads).into_iter().map(|x| GenericBuilder::ProcessBinary(x)).collect(), Box::new(())))
-            },
-            Config::Cluster { threads, process, addresses, report, log_fn } => {
-                match initialize_networking(addresses, process, threads, report, log_fn) {
-                    Ok((stuff, guard)) => {
-                        Ok((stuff.into_iter().map(|x| GenericBuilder::ZeroCopy(x)).collect(), Box::new(guard)))
-                    },
-                    Err(err) => Err(format!("failed to initialize networking: {}", err))
-                }
+            Config::IoUring {
+                threads,
+                process,
+                addresses,
+                report,
+                log_fn,
+            } => match uring_initialize_networking(addresses, process, threads, report, log_fn) {
+                Ok(stuff) => Ok((
+                    stuff
+                        .into_iter()
+                        .map(|x| GenericBuilder::IoUring(x))
+                        .collect(),
+                    Box::new(()),
+                )),
+                Err(err) => Err(format!("failed to initialize networking: {}", err)),
             },
         }
     }
@@ -236,10 +367,10 @@ impl Config {
 /// result: Ok(0)
 /// result: Ok(1)
 /// ```
-pub fn initialize<T:Send+'static, F: Fn(Generic)->T+Send+Sync+'static>(
+pub fn initialize<T: Send + 'static, F: Fn(Generic) -> T + Send + Sync + 'static>(
     config: Config,
     func: F,
-) -> Result<WorkerGuards<T>,String> {
+) -> Result<WorkerGuards<T>, String> {
     let (allocators, others) = config.try_build()?;
     initialize_from(allocators, others, func)
 }
@@ -297,45 +428,46 @@ pub fn initialize<T:Send+'static, F: Fn(Generic)->T+Send+Sync+'static>(
 /// ```
 pub fn initialize_from<A, T, F>(
     builders: Vec<A>,
-    others: Box<dyn Any+Send>,
+    others: Box<dyn Any + Send>,
     func: F,
-) -> Result<WorkerGuards<T>,String>
+) -> Result<WorkerGuards<T>, String>
 where
-    A: AllocateBuilder+'static,
-    T: Send+'static,
-    F: Fn(<A as AllocateBuilder>::Allocator)->T+Send+Sync+'static
+    A: AllocateBuilder + 'static,
+    T: Send + 'static,
+    F: Fn(<A as AllocateBuilder>::Allocator) -> T + Send + Sync + 'static,
 {
     let logic = Arc::new(func);
     let mut guards = Vec::new();
     for (index, builder) in builders.into_iter().enumerate() {
         let clone = logic.clone();
-        guards.push(thread::Builder::new()
-                            .name(format!("timely:work-{}", index))
-                            .spawn(move || {
-                                let communicator = builder.build();
-                                (*clone)(communicator)
-                            })
-                            .map_err(|e| format!("{:?}", e))?);
+        guards.push(
+            thread::Builder::new()
+                .name(format!("timely:work-{}", index))
+                .spawn(move || {
+                    let communicator = builder.build();
+                    (*clone)(communicator)
+                })
+                .map_err(|e| format!("{:?}", e))?,
+        );
     }
 
     Ok(WorkerGuards { guards, others })
 }
 
 /// Maintains `JoinHandle`s for worker threads.
-pub struct WorkerGuards<T:Send+'static> {
+pub struct WorkerGuards<T: Send + 'static> {
     guards: Vec<::std::thread::JoinHandle<T>>,
-    others: Box<dyn Any+Send>,
+    others: Box<dyn Any + Send>,
 }
 
-impl<T:Send+'static> WorkerGuards<T> {
-
+impl<T: Send + 'static> WorkerGuards<T> {
     /// Returns a reference to the indexed guard.
     pub fn guards(&self) -> &[std::thread::JoinHandle<T>] {
         &self.guards[..]
     }
 
     /// Provides access to handles that are not worker threads.
-    pub fn others(&self) -> &Box<dyn Any+Send> {
+    pub fn others(&self) -> &Box<dyn Any + Send> {
         &self.others
     }
 
@@ -348,7 +480,7 @@ impl<T:Send+'static> WorkerGuards<T> {
     }
 }
 
-impl<T:Send+'static> Drop for WorkerGuards<T> {
+impl<T: Send + 'static> Drop for WorkerGuards<T> {
     fn drop(&mut self) {
         for guard in self.guards.drain(..) {
             guard.join().expect("Worker panic");

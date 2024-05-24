@@ -16,6 +16,7 @@ pub mod canary;
 pub mod counters;
 
 pub mod zero_copy;
+pub mod io_uring;
 
 use crate::{Data, Push, Pull, Message};
 

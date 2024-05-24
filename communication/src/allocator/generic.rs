@@ -6,6 +6,7 @@
 use std::rc::Rc;
 use std::cell::RefCell;
 
+use crate::allocator::io_uring::allocator::{IoUringAllocator, IoUringBuilder};
 use crate::allocator::thread::ThreadBuilder;
 use crate::allocator::process::ProcessBuilder as TypedProcessBuilder;
 use crate::allocator::{Allocate, AllocateBuilder, Thread, Process};
@@ -25,6 +26,8 @@ pub enum Generic {
     ProcessBinary(ProcessAllocator),
     /// Inter-process allocator.
     ZeroCopy(TcpAllocator<Process>),
+    /// Inter-process allocator.
+    IoUring(IoUringAllocator),
 }
 
 impl Generic {
@@ -35,6 +38,7 @@ impl Generic {
             Generic::Process(p) => p.index(),
             Generic::ProcessBinary(pb) => pb.index(),
             Generic::ZeroCopy(z) => z.index(),
+            Generic::IoUring(u) => u.index(),
         }
     }
     /// The number of workers.
@@ -44,6 +48,7 @@ impl Generic {
             Generic::Process(p) => p.peers(),
             Generic::ProcessBinary(pb) => pb.peers(),
             Generic::ZeroCopy(z) => z.peers(),
+            Generic::IoUring(u) => u.peers(),
         }
     }
     /// Constructs several send endpoints and one receive endpoint.
@@ -53,6 +58,7 @@ impl Generic {
             Generic::Process(p) => p.allocate(identifier),
             Generic::ProcessBinary(pb) => pb.allocate(identifier),
             Generic::ZeroCopy(z) => z.allocate(identifier),
+            Generic::IoUring(u) => u.allocate(identifier),
         }
     }
     /// Perform work before scheduling operators.
@@ -62,6 +68,7 @@ impl Generic {
             Generic::Process(p) => p.receive(),
             Generic::ProcessBinary(pb) => pb.receive(),
             Generic::ZeroCopy(z) => z.receive(),
+            Generic::IoUring(u) => u.receive(),
         }
     }
     /// Perform work after scheduling operators.
@@ -71,6 +78,7 @@ impl Generic {
             Generic::Process(p) => p.release(),
             Generic::ProcessBinary(pb) => pb.release(),
             Generic::ZeroCopy(z) => z.release(),
+            Generic::IoUring(u) => u.release(),
         }
     }
     fn events(&self) -> &Rc<RefCell<Vec<usize>>> {
@@ -79,6 +87,7 @@ impl Generic {
             Generic::Process(ref p) => p.events(),
             Generic::ProcessBinary(ref pb) => pb.events(),
             Generic::ZeroCopy(ref z) => z.events(),
+            Generic::IoUring(ref u) => u.events(),
         }
     }
 }
@@ -99,10 +108,10 @@ impl Allocate for Generic {
             Generic::Process(p) => p.await_events(_duration),
             Generic::ProcessBinary(pb) => pb.await_events(_duration),
             Generic::ZeroCopy(z) => z.await_events(_duration),
+            Generic::IoUring(u) => u.await_events(_duration),
         }
     }
 }
-
 
 /// Enumerations of constructable implementors of `Allocate`.
 ///
@@ -118,6 +127,8 @@ pub enum GenericBuilder {
     ProcessBinary(ProcessBuilder),
     /// Builder for `ZeroCopy` allocator.
     ZeroCopy(TcpBuilder<TypedProcessBuilder>),
+    /// Builder for `ZeroCopy` allocator.
+    IoUring(IoUringBuilder),
 }
 
 impl AllocateBuilder for GenericBuilder {
@@ -128,6 +139,7 @@ impl AllocateBuilder for GenericBuilder {
             GenericBuilder::Process(p) => Generic::Process(p.build()),
             GenericBuilder::ProcessBinary(pb) => Generic::ProcessBinary(pb.build()),
             GenericBuilder::ZeroCopy(z) => Generic::ZeroCopy(z.build()),
+            GenericBuilder::IoUring(uring) => Generic::IoUring(uring.build()),
         }
     }
 }
