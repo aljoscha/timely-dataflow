@@ -193,7 +193,8 @@ impl Config {
                 report,
                 log_fn: Box::new(|_| None),
             })
-        } else if processes > 1 && io_uring {
+        } else if io_uring {
+            // Use io-uring, even within one process! Makes testing easier.
             let mut addresses = Vec::new();
             if let Some(hosts) = matches.opt_str("h") {
                 let file = ::std::fs::File::open(hosts.clone()).map_err(|e| e.to_string())?;
