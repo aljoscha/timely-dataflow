@@ -1,20 +1,21 @@
 //! Zero-copy allocator based on TCP.
 use std::cell::RefCell;
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::io::Write;
 use std::net::TcpStream;
 use std::rc::Rc;
 
 use bytes::arc::Bytes;
 
+use crate::allocator::canary::Canary;
 use crate::allocator::io_uring::bytes_exchange::{BytesPull, MergeQueue, SendEndpoint};
+use crate::allocator::io_uring::bytes_slab::BytesSlab;
 use crate::allocator::io_uring::push_pull::{Puller, Pusher};
 use crate::networking::MessageHeader;
-use crate::allocator::canary::Canary;
 use crate::{Allocate, Data, Message, Pull, Push};
 
-
 /// Builds an instance of a [IoUringAllocator].
-#[derive(Debug)]
+//#[derive(Debug)]
 pub struct IoUringBuilder {
     /// Logical worker index, not process index.
     pub index: usize,
@@ -30,11 +31,13 @@ impl IoUringBuilder {
     /// Builds a `TcpAllocator`, instantiating `Rc<RefCell<_>>` elements.
     pub fn build(self) -> IoUringAllocator {
         let mut sends = Vec::with_capacity(self.peers);
+        let mut send_queues = Vec::with_capacity(self.peers);
         let mut recvs = Vec::with_capacity(self.peers);
 
         for socket in self.sockets.iter() {
             if socket.is_some() {
                 let send_queue = MergeQueue::new();
+                send_queues.push(send_queue.clone());
                 let sendpoint = SendEndpoint::new(send_queue);
                 sends.push(Rc::new(RefCell::new(sendpoint)));
 
@@ -57,6 +60,7 @@ impl IoUringBuilder {
             events: Rc::new(RefCell::new(Default::default())),
             sockets: self.sockets,
             sends,
+            send_queues,
             recvs,
             to_local: HashMap::new(),
         }
@@ -76,7 +80,8 @@ pub struct IoUringAllocator {
 
     // sending, receiving, and responding to binary buffers.
     sends: Vec<Rc<RefCell<SendEndpoint<MergeQueue>>>>, // sends[x] -> goes to process x.
-    recvs: Vec<MergeQueue>,                            // recvs[x] <- from process x.
+    send_queues: Vec<MergeQueue>,
+    recvs: Vec<MergeQueue>, // recvs[x] <- from process x.
     sockets: Vec<Option<TcpStream>>,
     to_local: HashMap<usize, Rc<RefCell<VecDeque<Bytes>>>>, // to worker-local typed pullers.
 }
@@ -156,6 +161,15 @@ impl Allocate for IoUringAllocator {
         }
         std::mem::drop(canaries);
 
+        let mut buffer = BytesSlab::new(20);
+        for (target_index, send_queue) in self.sockets.iter_mut().enumerate() {
+            if target_index == self.index {
+                continue;
+            }
+
+            l
+        }
+
         for recv in self.recvs.iter_mut() {
             recv.drain_into(&mut self.staged);
         }
@@ -208,6 +222,29 @@ impl Allocate for IoUringAllocator {
             send.borrow_mut().publish();
         }
 
+        let mut stash = Vec::new();
+        for (target_index, send_queue) in self.send_queues.iter_mut().enumerate() {
+            if target_index == self.index {
+                continue;
+            }
+
+            assert!(stash.is_empty());
+
+            let writer = self.sockets[target_index]
+                .as_mut()
+                .expect("we're only sending to remote workers");
+
+            send_queue.drain_into(&mut stash);
+
+            for bytes in stash.drain(..) {
+                println!("sending: {}", bytes.len());
+
+                writer
+                    .write_all(&bytes[..])
+                    .unwrap_or_else(|e| tcp_panic("writing data", e));
+            }
+        }
+
         // OPTIONAL: Tattle on channels sitting on borrowed data.
         // OPTIONAL: Perhaps copy borrowed data into owned allocation.
         // for (index, list) in self.to_local.iter() {
@@ -231,4 +268,12 @@ impl Allocate for IoUringAllocator {
             }
         }
     }
+}
+
+fn tcp_panic(context: &'static str, cause: std::io::Error) -> ! {
+    // NOTE: some downstream crates sniff out "timely communication error:" from
+    // the panic message. Avoid removing or rewording this message if possible.
+    // It'd be nice to instead use `panic_any` here with a structured error
+    // type, but the panic message for `panic_any` is no good (Box<dyn Any>).
+    panic!("timely communication error: {}: {}", context, cause)
 }
