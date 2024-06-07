@@ -48,7 +48,7 @@ pub fn initialize_networking(
     process_index: usize,
     threads: usize,
     noisy: bool,
-    log_sender: Box<
+    _log_sender: Box<
         dyn Fn(CommunicationSetup) -> Option<Logger<CommunicationEvent, CommunicationSetup>>
             + Send
             + Sync,
@@ -68,6 +68,7 @@ pub fn initialize_networking(
         .enumerate()
         .map(|(local_index, sockets)| {
             let index = process_index * threads + local_index;
+
             IoUringBuilder {
                 index,
                 peers,
@@ -76,7 +77,7 @@ pub fn initialize_networking(
         })
         .collect();
 
-    println!("builders: {:#?}", builders);
+    //println!("builders: {:#?}", builders);
 
     Ok(builders)
 }
