@@ -54,14 +54,14 @@ pub fn initialize_networking(
             + Sync,
     >,
 ) -> ::std::io::Result<Vec<IoUringBuilder>> {
-    println!(
-        "addresses: {:?}, my_index: {process_index}, threads: {threads}",
-        addresses
-    );
+    //println!(
+    //    "addresses: {:?}, my_index: {process_index}, threads: {threads}",
+    //    addresses
+    //);
     let peers = addresses.len();
 
     let sockets = create_sockets(addresses, threads, process_index, noisy)?;
-    println!("sockets: {:#?}", sockets);
+    //println!("sockets: {:#?}", sockets);
 
     let builders = sockets
         .into_iter()

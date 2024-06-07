@@ -3,12 +3,15 @@ use std::cell::RefCell;
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::io::Write;
 use std::net::TcpStream;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
 
 use bytes::arc::Bytes;
+use io_uring::{opcode, types, IoUring};
+use slab::Slab;
 
 use crate::allocator::canary::Canary;
-use crate::allocator::io_uring::bytes_exchange::{BytesPull, MergeQueue, SendEndpoint};
+use crate::allocator::io_uring::bytes_exchange::{BytesPull, BytesPush, MergeQueue, SendEndpoint};
 use crate::allocator::io_uring::bytes_slab::BytesSlab;
 use crate::allocator::io_uring::push_pull::{Puller, Pusher};
 use crate::networking::MessageHeader;
@@ -45,11 +48,71 @@ impl IoUringBuilder {
                 recvs.push(recv_queue);
             } else {
                 let local_queue = MergeQueue::new();
+                send_queues.push(local_queue.clone());
                 let sendpoint = SendEndpoint::new(local_queue.clone());
                 sends.push(Rc::new(RefCell::new(sendpoint)));
                 recvs.push(local_queue);
             }
         }
+
+        let mut ring = IoUring::new(256).expect("can construct uring");
+        let mut bufpool = Vec::with_capacity(64);
+        let mut buf_alloc = Slab::with_capacity(64);
+        let mut token_alloc = Slab::with_capacity(64);
+
+        let socket_fds: Vec<Option<RawFd>> = self
+            .sockets
+            .iter()
+            .map(|s| s.as_ref().map(|s| s.as_raw_fd()))
+            .collect();
+
+        // Put in place read requests for all sockets.
+
+        let mut outstanding_entries = 0;
+
+        for (index, socket_fd) in socket_fds.iter().enumerate() {
+            let socket_fd = match socket_fd {
+                Some(fd) => fd,
+                None => continue,
+            };
+            //println!("putting in read for index {index}!");
+            let (buf_index, buf) = match bufpool.pop() {
+                Some(buf_index) => (buf_index, &mut buf_alloc[buf_index]),
+                None => {
+                    let buf = BytesSlab::new(20);
+                    let buf_entry = buf_alloc.vacant_entry();
+                    let buf_index = buf_entry.key();
+                    (buf_index, buf_entry.insert(buf))
+                }
+            };
+
+            let read_token = token_alloc.insert(Token::Read {
+                fd: *socket_fd,
+                buf_index,
+                target_index: index,
+            });
+
+            let read_e = opcode::Recv::new(
+                types::Fd(*socket_fd),
+                buf.empty().as_mut_ptr(),
+                buf.empty().len() as _,
+            )
+            .build()
+            .user_data(read_token as _);
+
+            // Yikes!
+            unsafe {
+                match ring.submission().push(&read_e) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        panic!("trying to submit initial reads: {:?}", e);
+                    }
+                }
+            }
+            outstanding_entries += 1;
+        }
+
+        ring.submit().expect("error submitting");
 
         IoUringAllocator {
             index: self.index,
@@ -63,6 +126,12 @@ impl IoUringBuilder {
             send_queues,
             recvs,
             to_local: HashMap::new(),
+            socket_fds,
+            ring,
+            outstanding_entries,
+            bufpool,
+            buf_alloc,
+            token_alloc,
         }
     }
 }
@@ -84,6 +153,14 @@ pub struct IoUringAllocator {
     recvs: Vec<MergeQueue>, // recvs[x] <- from process x.
     sockets: Vec<Option<TcpStream>>,
     to_local: HashMap<usize, Rc<RefCell<VecDeque<Bytes>>>>, // to worker-local typed pullers.
+
+    // io-uring business
+    ring: IoUring,
+    outstanding_entries: usize,
+    bufpool: Vec<usize>,
+    buf_alloc: Slab<BytesSlab>,
+    token_alloc: Slab<Token>,
+    socket_fds: Vec<Option<RawFd>>,
 }
 
 impl Allocate for IoUringAllocator {
@@ -161,13 +238,132 @@ impl Allocate for IoUringAllocator {
         }
         std::mem::drop(canaries);
 
-        let mut buffer = BytesSlab::new(20);
-        for (target_index, send_queue) in self.sockets.iter_mut().enumerate() {
-            if target_index == self.index {
+        //println!(
+        //    "receive!, outstanding_entries: {}",
+        //    self.outstanding_entries
+        //);
+        //if self.outstanding_entries > 0 {
+            //self.ring.submit_and_wait(1).expect("error submitting");
+            //self.ring.submit().expect("error submitting");
+        //}
+
+        //println!("sync!");
+        let mut cq = self.ring.completion();
+        //cq.sync();
+
+        let mut new_entries = Vec::new();
+
+        for cqe in &mut cq {
+            self.outstanding_entries -= 1;
+            //println!("cqe: {:?}", cqe);
+
+            let ret = cqe.result();
+            let token_index = cqe.user_data() as usize;
+
+            if ret < 0 {
+                eprintln!(
+                    "token {:?} error: {:?}",
+                    self.token_alloc.get(token_index),
+                    std::io::Error::from_raw_os_error(-ret)
+                );
                 continue;
             }
 
-            l
+            let token = &mut self.token_alloc[token_index];
+
+            match token.clone() {
+                Token::Read {
+                    fd,
+                    buf_index,
+                    target_index,
+                } => {
+                    //if ret == 0 {
+                    //    self.bufpool.push(buf_index);
+                    //    self.token_alloc.remove(token_index);
+                    //
+                    //    println!("socket shutting down?");
+                    //
+                    //    unsafe {
+                    //        libc::close(fd);
+                    //    }
+                    //} else {
+                        self.token_alloc.remove(token_index);
+
+                        let mut still_active = true;
+                        let len = ret as usize;
+                        let buf = &mut self.buf_alloc[buf_index];
+
+                        println!("received len: {}", len);
+
+                        buf.make_valid(len);
+
+                        // Consume complete messages from the front of self.buffer.
+                        while let Some(header) = MessageHeader::try_read(buf.valid()) {
+                            // TODO: Consolidate message sequences sent to the same worker?
+                            let peeled_bytes = header.required_bytes();
+                            let bytes = buf.extract(peeled_bytes);
+
+                            if header.length > 0 {
+                                self.recvs[target_index].extend(vec![bytes]);
+                            } else {
+                                // Shutting down; confirm absence of subsequent data.
+                                still_active = false;
+                                if !buf.valid().is_empty() {
+                                    panic!("Clean shutdown followed by data.");
+                                }
+                            }
+                        }
+
+                        if !still_active {
+                            continue;
+                        }
+
+                        //println!("putting in read for index {target_index}!");
+
+                        let read_token = self.token_alloc.insert(Token::Read {
+                            fd,
+                            buf_index,
+                            target_index,
+                        });
+
+                        //println!("buf empty len {}", buf.empty().len());
+                        buf.ensure_capacity(1024);
+                        let read_e = opcode::Recv::new(
+                            types::Fd(fd),
+                            buf.empty().as_mut_ptr(),
+                            buf.empty().len() as _,
+                        )
+                        .build()
+                        .user_data(read_token as _);
+
+                        new_entries.push(read_e);
+                    //}
+                }
+                Token::Write {
+                    fd: _,
+                    buf_index: _,
+                    offset: _,
+                    len: _,
+                } => unreachable!("not doing uring writes yet"),
+            }
+        }
+
+        drop(cq);
+
+        for entry in new_entries.iter() {
+            // Yikes!
+            unsafe {
+                match self.ring.submission().push(entry) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        panic!("trying to submit new entry {:?}: {:?}", entry, e);
+                    }
+                }
+            }
+            self.outstanding_entries += 1;
+        }
+        if self.outstanding_entries > 0 {
+            self.ring.submit().expect("error submitting");
         }
 
         for recv in self.recvs.iter_mut() {
@@ -224,6 +420,7 @@ impl Allocate for IoUringAllocator {
 
         let mut stash = Vec::new();
         for (target_index, send_queue) in self.send_queues.iter_mut().enumerate() {
+            //println!("release!, target_index: {}", target_index);
             if target_index == self.index {
                 continue;
             }
@@ -259,14 +456,13 @@ impl Allocate for IoUringAllocator {
         &self.events
     }
 
-    fn await_events(&self, duration: Option<std::time::Duration>) {
-        if self.events.borrow().is_empty() {
-            if let Some(duration) = duration {
-                std::thread::park_timeout(duration);
-            } else {
-                std::thread::park();
-            }
-        }
+    fn await_events(&self, _duration: Option<std::time::Duration>) {
+        //if self.outstanding_entries > 0 {
+        //    self.ring.submit_and_wait(1).expect("error submitting");
+        //}
+        //if let Some(duration) = duration {
+        //    std::thread::park_timeout(duration);
+        //}
     }
 }
 
@@ -276,4 +472,19 @@ fn tcp_panic(context: &'static str, cause: std::io::Error) -> ! {
     // It'd be nice to instead use `panic_any` here with a structured error
     // type, but the panic message for `panic_any` is no good (Box<dyn Any>).
     panic!("timely communication error: {}: {}", context, cause)
+}
+
+#[derive(Clone, Debug)]
+enum Token {
+    Read {
+        fd: RawFd,
+        buf_index: usize,
+        target_index: usize,
+    },
+    Write {
+        fd: RawFd,
+        buf_index: usize,
+        offset: usize,
+        len: usize,
+    },
 }

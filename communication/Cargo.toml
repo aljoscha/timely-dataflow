@@ -26,3 +26,8 @@ abomonation_derive = "0.5"
 timely_bytes = { path = "../bytes", version = "0.12" }
 timely_logging = { path = "../logging", version = "0.12" }
 crossbeam-channel = "0.5.0"
+io-uring = "0.6"
+slab = "0.4"
+libc = { version = "0.2.98", default-features = false }
+bytes = "1.5"
+
