@@ -130,7 +130,8 @@ impl IoUringBuilder {
             ring,
             outstanding_entries,
             bufpool,
-            buf_alloc,
+            write_buf_alloc: Slab::with_capacity(64),
+            read_buf_alloc: buf_alloc,
             token_alloc,
         }
     }
@@ -158,7 +159,8 @@ pub struct IoUringAllocator {
     ring: IoUring,
     outstanding_entries: usize,
     bufpool: Vec<usize>,
-    buf_alloc: Slab<BytesSlab>,
+    write_buf_alloc: Slab<Bytes>,
+    read_buf_alloc: Slab<BytesSlab>,
     token_alloc: Slab<Token>,
     socket_fds: Vec<Option<RawFd>>,
 }
@@ -243,8 +245,8 @@ impl Allocate for IoUringAllocator {
         //    self.outstanding_entries
         //);
         //if self.outstanding_entries > 0 {
-            //self.ring.submit_and_wait(1).expect("error submitting");
-            //self.ring.submit().expect("error submitting");
+        //self.ring.submit_and_wait(1).expect("error submitting");
+        //self.ring.submit().expect("error submitting");
         //}
 
         //println!("sync!");
@@ -287,64 +289,71 @@ impl Allocate for IoUringAllocator {
                     //        libc::close(fd);
                     //    }
                     //} else {
-                        self.token_alloc.remove(token_index);
+                    self.token_alloc.remove(token_index);
 
-                        let mut still_active = true;
-                        let len = ret as usize;
-                        let buf = &mut self.buf_alloc[buf_index];
+                    let mut still_active = true;
+                    let len = ret as usize;
+                    let buf = &mut self.read_buf_alloc[buf_index];
 
-                        println!("received len: {}", len);
+                    //println!("received len: {}", len);
 
-                        buf.make_valid(len);
+                    buf.make_valid(len);
 
-                        // Consume complete messages from the front of self.buffer.
-                        while let Some(header) = MessageHeader::try_read(buf.valid()) {
-                            // TODO: Consolidate message sequences sent to the same worker?
-                            let peeled_bytes = header.required_bytes();
-                            let bytes = buf.extract(peeled_bytes);
+                    // Consume complete messages from the front of self.buffer.
+                    while let Some(header) = MessageHeader::try_read(buf.valid()) {
+                        // TODO: Consolidate message sequences sent to the same worker?
+                        let peeled_bytes = header.required_bytes();
+                        let bytes = buf.extract(peeled_bytes);
 
-                            if header.length > 0 {
-                                self.recvs[target_index].extend(vec![bytes]);
-                            } else {
-                                // Shutting down; confirm absence of subsequent data.
-                                still_active = false;
-                                if !buf.valid().is_empty() {
-                                    panic!("Clean shutdown followed by data.");
-                                }
+                        if header.length > 0 {
+                            self.recvs[target_index].extend(vec![bytes]);
+                        } else {
+                            // Shutting down; confirm absence of subsequent data.
+                            still_active = false;
+                            if !buf.valid().is_empty() {
+                                panic!("Clean shutdown followed by data.");
                             }
                         }
+                    }
 
-                        if !still_active {
-                            continue;
-                        }
+                    if !still_active {
+                        continue;
+                    }
 
-                        //println!("putting in read for index {target_index}!");
+                    //println!("putting in read for index {target_index}!");
 
-                        let read_token = self.token_alloc.insert(Token::Read {
-                            fd,
-                            buf_index,
-                            target_index,
-                        });
+                    let read_token = self.token_alloc.insert(Token::Read {
+                        fd,
+                        buf_index,
+                        target_index,
+                    });
 
-                        //println!("buf empty len {}", buf.empty().len());
-                        buf.ensure_capacity(1024);
-                        let read_e = opcode::Recv::new(
-                            types::Fd(fd),
-                            buf.empty().as_mut_ptr(),
-                            buf.empty().len() as _,
-                        )
-                        .build()
-                        .user_data(read_token as _);
+                    //println!("buf empty len {}", buf.empty().len());
+                    buf.ensure_capacity(1024);
+                    let read_e = opcode::Recv::new(
+                        types::Fd(fd),
+                        buf.empty().as_mut_ptr(),
+                        buf.empty().len() as _,
+                    )
+                    .build()
+                    .user_data(read_token as _);
 
-                        new_entries.push(read_e);
+                    new_entries.push(read_e);
                     //}
                 }
                 Token::Write {
                     fd: _,
-                    buf_index: _,
+                    buf_index,
                     offset: _,
-                    len: _,
-                } => unreachable!("not doing uring writes yet"),
+                    len,
+                } => {
+                    if len != ret as usize {
+                        panic!("did no send everything! expected = {len}, actual = {ret}");
+                    }
+
+                    self.token_alloc.remove(token_index);
+                    self.write_buf_alloc.remove(buf_index);
+                }
             }
         }
 
@@ -434,11 +443,35 @@ impl Allocate for IoUringAllocator {
             send_queue.drain_into(&mut stash);
 
             for bytes in stash.drain(..) {
-                println!("sending: {}", bytes.len());
+                let len = bytes.len();
+                let fd = self.socket_fds[target_index].expect("only sending to remove workers");
+                //println!("sending: {}", len);
 
-                writer
-                    .write_all(&bytes[..])
-                    .unwrap_or_else(|e| tcp_panic("writing data", e));
+                let buf_entry = self.write_buf_alloc.vacant_entry();
+                let buf_index = buf_entry.key();
+                let buf = buf_entry.insert(bytes);
+
+                let write_token = self.token_alloc.insert(Token::Write {
+                    fd,
+                    buf_index,
+                    len,
+                    offset: 0,
+                });
+
+                let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
+                    .build()
+                    .user_data(write_token as _);
+
+                unsafe {
+                    match self.ring.submission().push(&write_e) {
+                        Ok(_) => (),
+                        Err(e) => {
+                            panic!("trying to submit write: {:?}", e);
+                        }
+                    }
+                }
+
+                self.outstanding_entries += 1;
             }
         }
 
